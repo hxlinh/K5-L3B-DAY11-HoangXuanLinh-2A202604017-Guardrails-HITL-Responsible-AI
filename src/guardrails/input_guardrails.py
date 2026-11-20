@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,45 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+# Ký tự "vô hình" kẻ tấn công hay chèn để bẻ regex: zero-width space/joiner, BOM...
+_INVISIBLE_CHARS = "\u200b\u200c\u200d\u2060\ufeff\u00ad"
+
+
+def normalize_text(text: str) -> str:
+    """Đưa text về dạng chuẩn TRƯỚC khi chạy regex.
+
+    1. NFKC: gộp các ký tự "trông giống nhau" về 1 dạng
+       (vd. chữ full-width 'ｉｇｎｏｒｅ' → 'ignore', non-breaking space → space).
+    2. Xoá ký tự vô hình (zero-width...).
+    3. Gộp mọi khoảng trắng liên tiếp thành 1 dấu cách.
+    """
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.translate(str.maketrans("", "", _INVISIBLE_CHARS))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+INJECTION_PATTERNS = [
+    # 1. Ra lệnh bỏ qua / quên / ghi đè chỉ dẫn cũ
+    r"\b(ignore|disregard|forget|override)\b.{0,20}\b(previous|above|prior|earlier|all|your|the)\b.{0,20}\b(instructions?|rules?|directives?|guidelines?|prompts?)\b",
+    # 2. Đổi vai: "you are now DAN"
+    r"\byou are now\b",
+    # 3. Nhắc tới system prompt / developer prompt
+    r"\b(system|developer|hidden)\s+(prompt|instructions?|message)\b",
+    # 4. Đòi tiết lộ chỉ dẫn/prompt/config
+    r"\b(reveal|show|print|repeat|output|dump)\b.{0,15}\b(your|the)\s+(instructions?|prompt|config(uration)?|rules)\b",
+    # 5. Giả vờ là ai khác
+    r"\bpretend (you are|to be|you're)\b",
+    # 6. Đóng vai AI không giới hạn
+    r"\bact as (a |an )?(unrestricted|unfiltered|jailbroken|evil|uncensored)\b",
+    # 7. Đòi trực tiếp credential
+    r"\b(reveal|show|tell|give|print|leak|share)\b.{0,25}\b(admin password|password|api[ _-]?key|credentials?|secrets?|db host|database host)\b",
+    # 8. Tiếng Việt
+    r"\b(bỏ qua|phớt lờ|quên)\b.{0,20}\b(hướng dẫn|chỉ dẫn|quy tắc)\b",
+    r"\btiết lộ\b.{0,20}\b(mật khẩu|api|system prompt|thông tin nội bộ)\b",
+]
+_COMPILED_INJECTION = [re.compile(p, re.IGNORECASE) for p in INJECTION_PATTERNS]
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,14 +91,9 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    text = normalize_text(user_input)
+    for pattern in _COMPILED_INJECTION:
+        if pattern.search(text):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +119,27 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    text = _strip_accents(normalize_text(user_input).lower())
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. Dính topic cấm → chặn (ưu tiên cao nhất)
+    for kw in BLOCKED_TOPICS:
+        if re.search(rf"\b{re.escape(kw)}", text):
+            return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. Có ít nhất 1 topic banking → cho qua
+    for kw in ALLOWED_TOPICS:
+        if re.search(rf"\b{re.escape(kw)}", text):
+            return "ALLOW"
+
+    # 3. Không liên quan banking (kể cả chuỗi rỗng) → chặn
+    return "BLOCK"
+
+
+def _strip_accents(text: str) -> str:
+    """'tài khoản' → 'tai khoan' để khớp ALLOWED_TOPICS (viết không dấu)."""
+    text = text.replace("đ", "d").replace("Đ", "D")
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
 
 
 # ============================================================
@@ -104,6 +152,16 @@ def topic_filter(user_input: str) -> InputStatus:
 #   - user_message is types.Content (not str)
 #   - Return types.Content to block, or None to pass through
 # ============================================================
+
+INJECTION_BLOCK_MESSAGE = (
+    "[input_guardrail:injection] Your request looks like an attempt to override "
+    "my instructions, so I can't process it. I can help with VinBank banking questions."
+)
+TOPIC_BLOCK_MESSAGE = (
+    "[input_guardrail:topic] Sorry, I can only help with VinBank banking topics "
+    "(accounts, transfers, savings, loans, credit cards)."
+)
+
 
 class InputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that blocks bad input before it reaches the LLM."""
@@ -144,14 +202,18 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 1. Injection trước: đây là tấn công, nghiêm trọng hơn lạc đề
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(INJECTION_BLOCK_MESSAGE)
 
-        pass  # Replace with your implementation
+        # 2. Topic: chỉ cho câu hỏi ngân hàng
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(TOPIC_BLOCK_MESSAGE)
+
+        # 3. An toàn → None = cho message đi tiếp tới LLM
+        return None
 
 
 # ============================================================

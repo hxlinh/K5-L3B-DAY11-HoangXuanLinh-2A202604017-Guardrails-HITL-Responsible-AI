@@ -13,6 +13,9 @@ from google.adk.plugins import base_plugin
 from google.genai import types
 
 
+RATE_LIMIT_MESSAGE_PREFIX = "[rate_limiter]"
+
+
 class RateLimitPlugin(base_plugin.BasePlugin):
     """Block users who exceed max_requests within window_seconds."""
 
@@ -37,13 +40,22 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         now = time.time()
         window = self.user_windows[user_id]
 
-        # TODO: Implement sliding window:
-        # 1. Pop timestamps older than (now - window_seconds) from the left
-        # 2. If len(window) >= max_requests:
-        #       wait = window_seconds - (now - window[0])
-        #       self.blocked_count += 1
-        #       return self._block_response(
-        #           f"Rate limit exceeded. Try again in {wait:.0f}s."
-        #       )
-        # 3. Else: append now, return None
-        raise NotImplementedError("Implement RateLimitPlugin.on_user_message_callback")
+        # 1. Trượt cửa sổ: bỏ các timestamp đã "hết hạn" (cũ hơn now - window)
+        #    deque giữ timestamp theo thứ tự thời gian → cái cũ nhất luôn ở bên trái
+        cutoff = now - self.window_seconds
+        while window and window[0] <= cutoff:
+            window.popleft()
+
+        # 2. Cửa sổ đã đầy → chặn, KHÔNG ghi timestamp (request bị chặn không tính quota)
+        if len(window) >= self.max_requests:
+            wait = self.window_seconds - (now - window[0])
+            self.blocked_count += 1
+            return self._block_response(
+                f"{RATE_LIMIT_MESSAGE_PREFIX} Rate limit exceeded "
+                f"({self.max_requests} requests / {self.window_seconds}s). "
+                f"Try again in {wait:.0f}s."
+            )
+
+        # 3. Còn quota → ghi lại thời điểm và cho qua
+        window.append(now)
+        return None
